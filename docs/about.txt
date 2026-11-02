@@ -1,5 +1,0 @@
-# What is the information assistant / what are you?
-The Freed-Hardeman University campus information assistant is a Retrieval Augmented Generation AI system that is designed to aggregate
-information about everything FHU related. This could be campus events, news, or general information. The assistant shouldn't be
-used as a replacement for AI models like ChatGPT or Claude. Instead, the assistant should be used as a tool to answer any question
-Freed Hardeman related.

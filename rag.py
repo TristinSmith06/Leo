@@ -3,7 +3,7 @@ Minimal RAG over local files using Ollama.
 
 Setup:
     pip install -U ollama numpy
-    pip install torch transformers   # Qwen3 reranker; downloads ~1.2GB on first run
+    pip install torch transformers   # Qwen3 reranker, only if USE_RERANKING = True (~1.2GB download)
     ollama pull qwen3-embedding:0.6b
     ollama pull qwen3:1.7b
 
@@ -22,12 +22,10 @@ from pathlib import Path
 
 import numpy as np
 import ollama
-import torch
 import yaml
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # ---- Config ----------------------------------------------------------------
-DOCS_DIR = Path("docs")
+DOCS_DIR = Path("data")
 INDEX_FILE = Path("index.json")
 ROOT_DIR = Path(__file__).resolve().parent
 
@@ -47,15 +45,18 @@ CHUNK_SIZE = 500          # characters per chunk
 CHUNK_OVERLAP = 80        # characters repeated between neighboring chunks of one section
 TOP_K_DENSE = 30          # chunks taken from dense (embedding) retrieval
 TOP_K_SPARSE = 30         # chunks taken from sparse (BM25 keyword) retrieval
-TOP_K_FUSED = 8           # chunks kept after reranking; all are passed to the LLM
+TOP_K_FUSED = 8           # chunks passed to the LLM (best by rerank score, or by RRF score if not reranking)
+USE_RERANKING = False      # True: rerank every fused chunk; False: take the top TOP_K_FUSED by RRF score
 RRF_K = 60                # reciprocal rank fusion constant: score = 1 / (RRF_K + rank)
 BM25_K1 = 1.5             # BM25 term-frequency saturation
 BM25_B = 0.75             # BM25 document-length normalization
 NUM_CTX = 16384           # LLM context window (tokens); must fit the final chunks (~150 tokens each) plus the prompt
 RERANK_MODEL = "Qwen/Qwen3-Reranker-0.6B"   # downloaded from Hugging Face on first use
 RERANK_TASK = "Given a student's question about campus services, people, or policies, retrieve the passages that answer it"
-RERANK_BATCH = 4          # chunks scored per forward pass; lower it if memory is tight
+RERANK_BATCH = 16         # chunks scored per forward pass; lower it if the GPU runs out of memory
 RERANK_MAX_LENGTH = 1024  # max tokens per (instruction + question + chunk)
+RERANK_DEVICE = "auto"     # "auto" uses a GPU if one is usable; or force "cuda" / "cpu"
+RERANK_DTYPE = "auto"      # "auto" picks the best for your GPU; or "float32" / "float16" / "bfloat16"
 EXTENSIONS = {".txt", ".md"}
 
 
@@ -322,21 +323,81 @@ RERANK_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 _reranker = None
 
 
+def _gpu_usable(torch) -> bool:
+    """True if a CUDA GPU exists AND this PyTorch build ships kernels that can run on it.
+
+    Newer PyTorch CUDA builds dropped older GPUs (e.g. Pascal / GTX 10-series), and on those
+    torch.cuda.is_available() is still True but every GPU call fails.
+    """
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability(0)
+    capability = major * 10 + minor
+    for arch in torch.cuda.get_arch_list():  # e.g. "sm_60", "sm_90", "compute_120"
+        kind, _, digits = arch.partition("_")
+        digits = "".join(ch for ch in digits if ch.isdigit())
+        if not digits:
+            continue
+        version = int(digits)
+        # Compiled code runs on the same GPU generation (equal or newer minor version);
+        # PTX ("compute_XX") also runs on any newer GPU.
+        if (kind == "sm" and version // 10 == major and version <= capability) or \
+           (kind == "compute" and version <= capability):
+            return True
+    return False
+
+
+def _pick_device_and_dtype(torch):
+    """Choose where and how to run the reranker (RERANK_DEVICE / RERANK_DTYPE can override)."""
+    if RERANK_DEVICE == "cpu":
+        device = "cpu"
+    else:
+        usable = _gpu_usable(torch)
+        if RERANK_DEVICE == "cuda" and not usable:
+            raise RuntimeError("RERANK_DEVICE is 'cuda' but no GPU this PyTorch build supports was found. "
+                               "Install a PyTorch build that matches your GPU, or set RERANK_DEVICE = 'auto'.")
+        if not usable and torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            print(f"Note: {name} is not supported by this PyTorch build, so the reranker will run on the CPU. "
+                  "Install a PyTorch build that still includes your GPU's architecture.")
+        elif not usable and torch.version.cuda is None:
+            print("Note: this PyTorch is a CPU-only build, so the reranker will run on the CPU. "
+                  "Install a CUDA build of PyTorch to use a GPU.")
+        device = "cuda" if usable else "cpu"
+
+    if RERANK_DTYPE != "auto":
+        dtype = getattr(torch, RERANK_DTYPE)
+    elif device == "cuda":
+        major = torch.cuda.get_device_capability(0)[0]
+        # bfloat16 on Ampere and newer; float16 on Volta/Turing; float32 on Pascal, whose float16 is very slow.
+        dtype = torch.bfloat16 if major >= 8 else torch.float16 if major == 7 else torch.float32
+    else:
+        dtype = torch.float32
+    return device, dtype
+
+
 def get_reranker():
     """Load the reranker once; the first question after startup pays the load time."""
     global _reranker
     if _reranker is None:
-        print(f"Loading reranker {RERANK_MODEL} (first question only)...")
+        import os
+        import torch
+        # transformers 5 loads model weights on a thread pool, which hard-crashes (no error
+        # message) on some Windows setups. This makes it load on the main thread instead.
+        os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        device, dtype = _pick_device_and_dtype(torch)
+        print(f"Loading reranker {RERANK_MODEL} on {device} ({str(dtype).replace('torch.', '')}), first question only...")
         tokenizer = AutoTokenizer.from_pretrained(RERANK_MODEL, padding_side="left")
-        model = AutoModelForCausalLM.from_pretrained(RERANK_MODEL).eval()
+        model = AutoModelForCausalLM.from_pretrained(RERANK_MODEL).to(device=device, dtype=dtype).eval()
         _reranker = (tokenizer, model,
                      tokenizer.convert_tokens_to_ids("yes"), tokenizer.convert_tokens_to_ids("no"))
     return _reranker
 
 
-@torch.no_grad()
 def rerank_scores(query: str, texts: list[str]) -> list[float]:
     """Return one relevance score (probability of "yes", 0 to 1) per text for this query."""
+    import torch
     tokenizer, model, yes_id, no_id = get_reranker()
     prefix = tokenizer.encode(RERANK_PREFIX, add_special_tokens=False)
     suffix = tokenizer.encode(RERANK_SUFFIX, add_special_tokens=False)
@@ -349,7 +410,9 @@ def rerank_scores(query: str, texts: list[str]) -> list[float]:
         for j, ids in enumerate(inputs["input_ids"]):
             inputs["input_ids"][j] = prefix + ids + suffix
         inputs = tokenizer.pad(inputs, padding=True, return_tensors="pt", max_length=RERANK_MAX_LENGTH)
-        logits = model(**inputs).logits[:, -1, :]
+        inputs = {key: value.to(model.device) for key, value in inputs.items()}
+        with torch.no_grad():
+            logits = model(**inputs).logits[:, -1, :].float()
         pair_logits = torch.stack([logits[:, no_id], logits[:, yes_id]], dim=1)
         scores += torch.nn.functional.log_softmax(pair_logits, dim=1)[:, 1].exp().tolist()
     return scores
@@ -358,10 +421,11 @@ def rerank_scores(query: str, texts: list[str]) -> list[float]:
 def retrieve(query: str, records: list[dict], matrix: np.ndarray,
              k_dense: int = TOP_K_DENSE, k_sparse: int = TOP_K_SPARSE,
              k_final: int = TOP_K_FUSED) -> list[dict]:
-    """Hybrid retrieval, then reranking.
+    """Hybrid retrieval, optionally followed by reranking.
 
-    Dense (embeddings) and sparse (BM25) results are merged with reciprocal rank fusion.
-    Every fused chunk is then reranked, and the best k_final are returned.
+    Dense (embeddings) and sparse (BM25) results are merged with reciprocal rank fusion (RRF).
+    If USE_RERANKING, every fused chunk is reranked and the best k_final are returned;
+    otherwise the k_final chunks with the highest RRF score are returned.
     """
     # Dense: cosine similarity between the query embedding and every chunk embedding.
     q = embed_query(query)
@@ -380,10 +444,14 @@ def retrieve(query: str, records: list[dict], matrix: np.ndarray,
         for i, r in ranks.items():
             fused[i] = fused.get(i, 0.0) + 1.0 / (RRF_K + r)
 
-    # Rerank every fused chunk (best RRF first, so ties keep their RRF order).
+    # Every fused chunk, best RRF first (so reranking ties keep their RRF order).
     candidates = sorted(fused, key=fused.get, reverse=True)
-    relevance = rerank_scores(query, [records[i]["text"] for i in candidates])
-    order = sorted(range(len(candidates)), key=lambda n: relevance[n], reverse=True)[:k_final]
+    if USE_RERANKING:
+        relevance = rerank_scores(query, [records[i]["text"] for i in candidates])
+        order = sorted(range(len(candidates)), key=lambda n: relevance[n], reverse=True)[:k_final]
+    else:
+        relevance = [None] * len(candidates)  # no rerank score without reranking
+        order = list(range(len(candidates)))[:k_final]  # candidates are already in RRF order
 
     return [{**records[candidates[n]], "rrf_score": fused[candidates[n]], "rerank_score": relevance[n],
              "dense_rank": dense_rank.get(candidates[n]), "sparse_rank": sparse_rank.get(candidates[n])}
@@ -431,7 +499,8 @@ def main():
         print("(Note: RRF scores are multiplied by 100 for readability.)")
         for h in hits:
             preview = " ".join(h["text"].split())[:140]
-            print(f"  [{h['source']}] (rerank {h['rerank_score']:.2f} | RRF {h['rrf_score'] * 100:.2f}) {preview}...")
+            rerank = f"rerank {h['rerank_score']:.2f} | " if h["rerank_score"] is not None else ""
+            print(f"  [{h['source']}] ({rerank}RRF {h['rrf_score'] * 100:.2f}) {preview}...")
 
         # ...then stream the generated answer as it is produced.
         print("\nOutput >> ", end="", flush=True)
