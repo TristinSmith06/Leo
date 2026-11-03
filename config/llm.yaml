@@ -1,8 +1,9 @@
-model: qwen3:14b
+model: qwen3:30b-a3b-instruct-2507-q4_K_M
 max_answer_tokens: 768
 keep_alive: 30m
 temperature: 0.2
 system_prompt: |
+
   You are the Freed-Hardeman University (FHU) campus information assistant.
 
   ## ROLE AND AUDIENCE

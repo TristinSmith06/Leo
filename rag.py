@@ -5,7 +5,7 @@ Setup:
     pip install -U ollama numpy
     pip install torch transformers   # Qwen3 reranker, only if USE_RERANKING = True (~1.2GB download)
     ollama pull qwen3-embedding:0.6b
-    ollama pull qwen3:1.7b
+    qwen3:30b-a3b-instruct-2507-q4_K_M
 
 Usage:
     1. Put .txt / .md files in ./docs
@@ -46,7 +46,7 @@ CHUNK_OVERLAP = 80        # characters repeated between neighboring chunks of on
 TOP_K_DENSE = 30          # chunks taken from dense (embedding) retrieval
 TOP_K_SPARSE = 30         # chunks taken from sparse (BM25 keyword) retrieval
 TOP_K_FUSED = 8           # chunks passed to the LLM (best by rerank score, or by RRF score if not reranking)
-USE_RERANKING = False      # True: rerank every fused chunk; False: take the top TOP_K_FUSED by RRF score
+USE_RERANKING = True      # True: rerank every fused chunk; False: take the top TOP_K_FUSED by RRF score
 RRF_K = 60                # reciprocal rank fusion constant: score = 1 / (RRF_K + rank)
 BM25_K1 = 1.5             # BM25 term-frequency saturation
 BM25_B = 0.75             # BM25 document-length normalization
@@ -102,7 +102,8 @@ def generate_stream(messages: list[dict]):
         options={
             "num_predict": llm_config['max_answer_tokens'],
             "temperature": llm_config['temperature'],
-            "num_ctx": NUM_CTX
+            "num_ctx": NUM_CTX,
+            "think": False
             },
         
     )
