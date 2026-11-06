@@ -6,7 +6,7 @@
 
     Put .txt / .md files in ./data
     A file may start with a line like ">> https://link"; that link is then the source of its chunks
-    python leo.py
+    python rag.py
     --reindex (force rebuild of vector db)
 """
 
@@ -505,6 +505,12 @@ def format_document(h: dict) -> str:
     return "<document>\n" + "\n".join(parts) + "\n</document>"
 
 
+def current_date_string() -> str:
+    """Today's date with the weekday, e.g. "Friday, November 6, 2026"."""
+    now = datetime.now()
+    return f"{now:%A}, {now:%B} {now.day}, {now.year}"
+
+
 def build_messages(query: str, hits: list[dict]) -> list[dict]:
     context = "\n\n".join(format_document(h) for h in hits)
 
@@ -512,6 +518,10 @@ def build_messages(query: str, hits: list[dict]) -> list[dict]:
         context = "(No reference documents retrieved.)"
 
     user_content = f"""\
+    <current_date>
+    {current_date_string()}
+    </current_date>
+
     <retrieved_context>
     {context}
     </retrieved_context>
