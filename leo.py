@@ -5,6 +5,7 @@
     ollama pull qwen3:30b-a3b-instruct-2507-q4_K_M
 
     Put .txt / .md files in ./data
+    A file may start with a line like ">> https://link"; that link is then the source of its chunks
     python leo.py
     --reindex (force rebuild of vector db)
 """
@@ -14,6 +15,7 @@ import math
 import re
 import sys
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -107,6 +109,38 @@ def generate_stream(messages: list[dict]):
 
 
 # ---- Ingestion --------------------------------------------------------------
+# A file may start with ">> <link>"; that link then becomes the source of every chunk in the file.
+LINK_LINE = re.compile(r"^\s*>>\s*(\S.*?)\s*$")
+MD_LINK = re.compile(r"^\[[^\]]*\]\(([^)\s]+)[^)]*\)$")
+
+
+def extract_link(text: str) -> tuple[str | None, str]:
+    """If the first line is ">> <link>", return (link, text without that line); else (None, text)."""
+    text = text.lstrip("\ufeff")  # drop a byte-order mark if the editor added one
+    first, _, rest = text.partition("\n")
+    match = LINK_LINE.match(first)
+    if not match:
+        return None, text
+    link = match.group(1)
+    md = MD_LINK.match(link)
+    if md:
+        link = md.group(1)                   # [label](https://...) -> https://...
+    elif link[0] in "[<" and link[-1] in "]>":
+        link = link[1:-1].strip()            # [https://...] or <https://...> -> https://...
+    return (link, rest) if link else (None, text)
+
+
+def file_creation_date(path: Path) -> str:
+    """Creation date of a file as YYYY-MM-DD.
+
+    Uses the real creation time where the OS provides it (Windows, macOS). Elsewhere (typically
+    Linux) Python cannot read it, so this falls back to the last metadata-change time.
+    """
+    st = path.stat()
+    timestamp = getattr(st, "st_birthtime", None) or st.st_ctime
+    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
+
+
 # Abbreviations that end in a period but do not end a sentence.
 ABBREVIATIONS = {"a.m.", "p.m.", "dr.", "mr.", "mrs.", "ms.", "prof.", "st.", "ave.",
                  "blvd.", "rm.", "dept.", "e.g.", "i.e.", "vs."}
@@ -197,16 +231,20 @@ def parse_sections(text: str) -> list[tuple[str, str]]:
     return sections
 
 
-def chunk_document(rel_path: Path, text: str) -> list[dict]:
-    """Chunk one file. Every chunk starts with its location (folder > file > section),
-    so it still makes sense on its own, for retrieval and for the model."""
+def chunk_document(rel_path: Path, text: str, source: str, file_creation_date: str) -> list[dict]:
+    """Chunk one file and pair every chunk with its metadata.
+
+    Each record holds: source, file_creation_date, header (the section heading, "" if none),
+    content (the bare chunk, shown to the LLM) and text (folder > file > section, then the chunk;
+    this is what gets embedded, keyword-searched and reranked, so it still makes sense on its own).
+    """
     where = [p.replace("-", " ").replace("_", " ") for p in rel_path.with_suffix("").parts]
     records = []
-    for heading, body in parse_sections(text):
-        context = " > ".join(where + ([heading] if heading else []))
+    for header, body in parse_sections(text):
+        context = " > ".join(where + ([header] if header else []))
         for chunk in pack_chunks(body):
-            records.append({"source": rel_path.as_posix(), "heading": heading,
-                            "text": f"{context}\n{chunk}"})
+            records.append({"source": source, "file_creation_date": file_creation_date,
+                            "header": header, "content": chunk, "text": f"{context}\n{chunk}"})
     return records
 
 
@@ -217,7 +255,7 @@ def index_meta() -> dict:
         "doc_prefix": DOC_PREFIX,
         "chunk_size": CHUNK_SIZE,
         "chunk_overlap": CHUNK_OVERLAP,
-        "chunker": "sections-v1",  # bump when chunking logic changes
+        "chunker": "sections-v2",  # bump when chunking logic changes
     }
 
 
@@ -228,7 +266,9 @@ def build_index() -> dict:
         if path.suffix.lower() not in EXTENSIONS:
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
-        records.extend(chunk_document(path.relative_to(DOCS_DIR), text))
+        link, text = extract_link(text)  # ">> link" first line, if any, is removed from the text
+        records.extend(chunk_document(path.relative_to(DOCS_DIR), text,
+                                      source=link or path.name, file_creation_date=file_creation_date(path)))
 
     if not records:
         sys.exit(f"No {', '.join(EXTENSIONS)} files found in ./{DOCS_DIR}")
@@ -455,11 +495,18 @@ def retrieve(query: str, records: list[dict], matrix: np.ndarray,
             for n in order]
 
 
+def format_document(h: dict) -> str:
+    """Wrap one chunk and its metadata in XML tags for the LLM. No header tag if there is no header."""
+    parts = [f"<source>{h['source']}</source>",
+             f"<file_creation_date>{h['file_creation_date']}</file_creation_date>"]
+    if h.get("header"):
+        parts.append(f"<header>{h['header']}</header>")
+    parts.append(f"<context>{h['content']}</context>")
+    return "<document>\n" + "\n".join(parts) + "\n</document>"
+
+
 def build_messages(query: str, hits: list[dict]) -> list[dict]:
-    context = "\n\n".join(
-        f"[{h['source']}]\n{h['text']}"
-        for h in hits
-    )
+    context = "\n\n".join(format_document(h) for h in hits)
 
     if not context:
         context = "(No reference documents retrieved.)"
