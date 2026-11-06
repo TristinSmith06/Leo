@@ -283,7 +283,7 @@ system_prompt_old: |
   ## SOURCE CITATIONS
 
   1. Cite the source of factual information using the exact
-    source identifiers provided with the retrieved documents.
+    source identifiers provided in the <source> tag of each retrieved document.
 
   2. Include citations immediately after the factual statement
     or paragraph they support.
@@ -341,9 +341,9 @@ system_prompt_old: |
   - If you do not use a document to answer the question, do not cite it.
   - At the end of the response, list all the sources you used, with their exact name, in the following format:
   Source(s):
-  [example document name 1]
-  [example document name 2]
-  [example document name 3]
+  1. (exact contents of the <source> tag)
+  2. (exact contents of the <source> tag)
+  3. (exact contents of the <source> tag)
 
   When you cannot answer a question because it is unrelated to FHU,
   address your aforementioned limitations and ask if there is anything
