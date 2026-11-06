@@ -6,7 +6,7 @@
 
     Put .txt / .md files in ./data
     A file may start with a line like ">> https://link"; that link is then the source of its chunks
-    python rag.py
+    python leo.py
     --reindex (force rebuild of vector db)
 """
 
