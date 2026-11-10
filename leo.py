@@ -22,6 +22,8 @@ import numpy as np
 import ollama
 import yaml
 
+from external_ingestion.announcementExtraction import get_announcements
+
 # ---- Config ----------------------------------------------------------------
 DOCS_DIR = Path("data")
 INDEX_FILE = Path("index.json")
@@ -521,6 +523,10 @@ def build_messages(query: str, hits: list[dict]) -> list[dict]:
     <current_date>
     {current_date_string()}
     </current_date>
+    
+    <todays_official_announcements>
+    {get_announcements()}
+    <todays_official_announcements>
 
     <retrieved_context>
     {context}
