@@ -5,7 +5,8 @@
     ollama pull qwen3:30b-a3b-instruct-2507-q4_K_M
 
     Put .txt / .md files in ./data
-    A file may start with a line like ">> https://link"; that link is then the source of its chunks
+    A file may start with YAML frontmatter (--- fenced); its fields go to the LLM, and "source" is the
+    chunk source (a file without one uses its file path)
     python leo.py
     --reindex (force rebuild of vector db)
 """
@@ -15,7 +16,7 @@ import math
 import re
 import sys
 from collections import Counter
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -111,36 +112,47 @@ def generate_stream(messages: list[dict]):
 
 
 # ---- Ingestion --------------------------------------------------------------
-# A file may start with ">> <link>"; that link then becomes the source of every chunk in the file.
-LINK_LINE = re.compile(r"^\s*>>\s*(\S.*?)\s*$")
-MD_LINK = re.compile(r"^\[[^\]]*\]\(([^)\s]+)[^)]*\)$")
+# A file may start with YAML frontmatter: a block fenced by "---" lines at the very top, e.g.
+#   ---
+#   source: "https://example.edu/page"
+#   date_extracted: "2026-11-21T19:07:54-06:00"
+#   ---
+FRONTMATTER = re.compile(r"\A---[ \t]*\n(?:(.*?)\n)??(?:---|\.\.\.)[ \t]*(?:\n|\Z)", re.DOTALL)
 
 
-def extract_link(text: str) -> tuple[str | None, str]:
-    """If the first line is ">> <link>", return (link, text without that line); else (None, text)."""
-    text = text.lstrip("\ufeff")  # drop a byte-order mark if the editor added one
-    first, _, rest = text.partition("\n")
-    match = LINK_LINE.match(first)
-    if not match:
-        return None, text
-    link = match.group(1)
-    md = MD_LINK.match(link)
-    if md:
-        link = md.group(1)                   # [label](https://...) -> https://...
-    elif link[0] in "[<" and link[-1] in "]>":
-        link = link[1:-1].strip()            # [https://...] or <https://...> -> https://...
-    return (link, rest) if link else (None, text)
+def _to_text(value) -> str:
+    """A frontmatter value as plain text (dates keep ISO format, lists are comma-joined)."""
+    if isinstance(value, date):  # also covers datetime; YAML turns unquoted timestamps into these
+        return value.isoformat()
+    if isinstance(value, (list, tuple)):
+        return ", ".join(t for t in (_to_text(v) for v in value) if t)
+    return "" if value is None else str(value).strip()
 
 
-def file_creation_date(path: Path) -> str:
-    """Creation date of a file as YYYY-MM-DD.
+def extract_frontmatter(text: str) -> tuple[dict, str]:
+    """Split YAML frontmatter from the body of a file.
 
-    Uses the real creation time where the OS provides it (Windows, macOS). Elsewhere (typically
-    Linux) Python cannot read it, so this falls back to the last metadata-change time.
+    Returns ({field: text}, body). Fields with empty values are dropped. If the file has no
+    valid frontmatter (no fence, bad YAML, or not a key/value block), returns ({}, text unchanged).
     """
-    st = path.stat()
-    timestamp = getattr(st, "st_birthtime", None) or st.st_ctime
-    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
+    text = text.lstrip("\ufeff")  # drop a byte-order mark if the editor added one
+    match = FRONTMATTER.match(text)
+    if not match:
+        return {}, text
+    try:
+        data = yaml.safe_load(match.group(1) or "")
+    except yaml.YAMLError:
+        return {}, text
+    if data is None:  # an empty block between the fences
+        data = {}
+    if not isinstance(data, dict):
+        return {}, text
+    fields = {}
+    for key, value in data.items():
+        value = _to_text(value)
+        if value:
+            fields[str(key)] = value
+    return fields, text[match.end():]
 
 
 # Abbreviations that end in a period but do not end a sentence.
@@ -233,20 +245,21 @@ def parse_sections(text: str) -> list[tuple[str, str]]:
     return sections
 
 
-def chunk_document(rel_path: Path, text: str, source: str, file_creation_date: str) -> list[dict]:
+def chunk_document(rel_path: Path, text: str, metadata: dict) -> list[dict]:
     """Chunk one file and pair every chunk with its metadata.
 
-    Each record holds: source, file_creation_date, header (the section heading, "" if none),
-    content (the bare chunk, shown to the LLM) and text (folder > file > section, then the chunk;
-    this is what gets embedded, keyword-searched and reranked, so it still makes sense on its own).
+    Each record holds: metadata (source plus any other frontmatter fields), header (the section
+    heading, "" if none), content (the bare chunk, shown to the LLM) and text (folder > file >
+    section, then the chunk; this is what gets embedded, keyword-searched and reranked, so it
+    still makes sense on its own).
     """
     where = [p.replace("-", " ").replace("_", " ") for p in rel_path.with_suffix("").parts]
     records = []
     for header, body in parse_sections(text):
         context = " > ".join(where + ([header] if header else []))
         for chunk in pack_chunks(body):
-            records.append({"source": source, "file_creation_date": file_creation_date,
-                            "header": header, "content": chunk, "text": f"{context}\n{chunk}"})
+            records.append({"metadata": dict(metadata), "header": header,
+                            "content": chunk, "text": f"{context}\n{chunk}"})
     return records
 
 
@@ -257,7 +270,7 @@ def index_meta() -> dict:
         "doc_prefix": DOC_PREFIX,
         "chunk_size": CHUNK_SIZE,
         "chunk_overlap": CHUNK_OVERLAP,
-        "chunker": "sections-v2",  # bump when chunking logic changes
+        "chunker": "sections-v3",  # bump when chunking logic changes
     }
 
 
@@ -268,18 +281,34 @@ def build_index() -> dict:
         if path.suffix.lower() not in EXTENSIONS:
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
-        link, text = extract_link(text)  # ">> link" first line, if any, is removed from the text
-        records.extend(chunk_document(path.relative_to(DOCS_DIR), text,
-                                      source=link or path.name, file_creation_date=file_creation_date(path)))
+        fields, text = extract_frontmatter(text)  # frontmatter, if any, is removed from the text
+        rel_path = path.relative_to(DOCS_DIR)
+        metadata = {"source": rel_path.as_posix(), **fields}  # the file's own "source" field wins
+        records.extend(chunk_document(rel_path, text, metadata))
 
     if not records:
         sys.exit(f"No {', '.join(EXTENSIONS)} files found in ./{DOCS_DIR}")
 
-    print(f"Embedding {len(records)} chunks...")
+    # print(f"Embedding {len(records)} chunks...")
+    # vectors = []
+    # for i in range(0, len(records), 32):  # batch to keep requests small
+    #     batch = [r["text"] for r in records[i:i + 32]]
+    #     vectors.append(embed_documents(batch))
+        
+        
+    print(f"Begin embedding {len(records)} chunks")
+
     vectors = []
     for i in range(0, len(records), 32):  # batch to keep requests small
         batch = [r["text"] for r in records[i:i + 32]]
         vectors.append(embed_documents(batch))
+
+        embedded = min(i + 32, len(records))
+        print(f"\rEmbedding chunks [{embedded} / {len(records)}]", end="", flush=True)
+
+    print()  # newline when complete    
+        
+    
     matrix = np.vstack(vectors)
 
     index = {"meta": index_meta(), "records": records, "embeddings": matrix.tolist()}
@@ -497,10 +526,24 @@ def retrieve(query: str, records: list[dict], matrix: np.ndarray,
             for n in order]
 
 
+RESERVED_TAGS = {"document", "header", "context"}  # tag names the prompt format already uses
+
+
+def xml_tag(name: str) -> str:
+    """Turn a frontmatter key into a safe XML tag name."""
+    tag = re.sub(r"\W+", "_", name.strip()).strip("_") or "field"
+    if tag[0].isdigit():
+        tag = "_" + tag
+    return "meta_" + tag if tag.lower() in RESERVED_TAGS else tag
+
+
 def format_document(h: dict) -> str:
-    """Wrap one chunk and its metadata in XML tags for the LLM. No header tag if there is no header."""
-    parts = [f"<source>{h['source']}</source>",
-             f"<file_creation_date>{h['file_creation_date']}</file_creation_date>"]
+    """Wrap one chunk in XML tags for the LLM.
+
+    Every metadata field (the source, plus any other frontmatter field the file defines) gets its
+    own tag. A header tag is added only if the chunk has a header, then the chunk itself.
+    """
+    parts = [f"<{xml_tag(k)}>{v}</{xml_tag(k)}>" for k, v in h["metadata"].items()]
     if h.get("header"):
         parts.append(f"<header>{h['header']}</header>")
     parts.append(f"<context>{h['content']}</context>")
@@ -524,9 +567,9 @@ def build_messages(query: str, hits: list[dict]) -> list[dict]:
     {current_date_string()}
     </current_date>
     
-    <todays_official_announcements>
+    <most_recent_announcements>
     {get_announcements()}
-    <todays_official_announcements>
+    </most_recent_announcements>
 
     <retrieved_context>
     {context}
@@ -560,7 +603,7 @@ def main():
         for h in hits:
             preview = " ".join(h["text"].split())[:140]
             rerank = f"rerank {h['rerank_score']:.2f} | " if h["rerank_score"] is not None else ""
-            print(f"  [{h['source']}] ({rerank}RRF {h['rrf_score'] * 100:.2f}) {preview}...")
+            print(f"  [{h['metadata']['source']}] ({rerank}RRF {h['rrf_score'] * 100:.2f}) {preview}...")
 
         # ...then stream the generated answer as it is produced.
         print("\nOutput >> ", end="", flush=True)
