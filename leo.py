@@ -288,14 +288,7 @@ def build_index() -> dict:
 
     if not records:
         sys.exit(f"No {', '.join(EXTENSIONS)} files found in ./{DOCS_DIR}")
-
-    # print(f"Embedding {len(records)} chunks...")
-    # vectors = []
-    # for i in range(0, len(records), 32):  # batch to keep requests small
-    #     batch = [r["text"] for r in records[i:i + 32]]
-    #     vectors.append(embed_documents(batch))
-        
-        
+ 
     print(f"Begin embedding {len(records)} chunks")
 
     vectors = []
@@ -304,7 +297,7 @@ def build_index() -> dict:
         vectors.append(embed_documents(batch))
 
         embedded = min(i + 32, len(records))
-        print(f"\rEmbedding chunks [{embedded} / {len(records)}]", end="", flush=True)
+        print(f"\rEmbedding chunks [{embedded} / {len(records)}] ({(embedded / len(records)) * 100:.2f}%)", end="", flush=True)
 
     print()  # newline when complete    
         
@@ -598,12 +591,13 @@ def main():
 
         # Retrieval is fast, so show what was found right away...
         hits = retrieve(query, records, matrix)
-        print("\nMost relevant passages:")
+        print(f"\n{TOP_K_FUSED} Most relevant passages:")
         print("(Note: RRF scores are multiplied by 100 for readability.)")
         for h in hits:
-            preview = " ".join(h["text"].split())[:140]
+            preview = " ".join(h["text"].split())[:50]
             rerank = f"rerank {h['rerank_score']:.2f} | " if h["rerank_score"] is not None else ""
             print(f"  [{h['metadata']['source']}] ({rerank}RRF {h['rrf_score'] * 100:.2f}) {preview}...")
+            print("")
 
         # ...then stream the generated answer as it is produced.
         print("\nOutput >> ", end="", flush=True)
