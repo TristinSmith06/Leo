@@ -479,7 +479,7 @@ def rerank_scores(query: str, texts: list[str]) -> list[float]:
     return scores
 
 
-def retrieve(query: str, records: list[dict], matrix: np.ndarray,
+def retrieve_chunks(query: str, records: list[dict], matrix: np.ndarray,
              k_dense: int = TOP_K_DENSE, k_sparse: int = TOP_K_SPARSE,
              k_final: int = TOP_K_FUSED) -> list[dict]:
     """Hybrid retrieval, optionally followed by reranking.
@@ -580,6 +580,58 @@ def build_messages(query: str, hits: list[dict]) -> list[dict]:
     ]
 
 
+# ---- Public API (call these from other code instead of using the CLI) -------
+_index = None  # (records, matrix); loaded on first use, then reused for every call
+
+
+def _get_index() -> tuple[list[dict], np.ndarray]:
+    """Load (or build, if missing or stale) the vector index once and reuse it."""
+    global _index
+    if _index is None:
+        _index = load_index()
+    return _index
+
+
+def _clean_question(question: str) -> str:
+    question = question.strip()
+    if not question:
+        raise ValueError("question must be a non-empty string")
+    return question
+
+
+def retrieve(question: str) -> list[dict]:
+    """Run hybrid retrieval and reranking for a question and return the chunks with their scores.
+
+    The list holds the chunks that would be given to the LLM, in the order the reranker chose
+    (best first; RRF order if USE_RERANKING is False). Each item looks like:
+
+        {"scores": {"rerank": 0.97, "rrf": 0.0328, "dense_rank": 1, "sparse_rank": 4},
+         "chunk":  {"metadata": {...}, "header": "...", "content": "...", "text": "..."}}
+
+    "rrf" is the raw RRF score (not multiplied by 100). "rerank" is None when reranking is off,
+    and a rank is None if that retriever did not return the chunk. "content" is the chunk text the
+    LLM reads; "text" is the location-prefixed version used for embedding, BM25 and reranking.
+    """
+    records, matrix = _get_index()
+    hits = retrieve_chunks(_clean_question(question), records, matrix)
+    return [{"scores": {"rerank": h["rerank_score"], "rrf": h["rrf_score"],
+                        "dense_rank": h["dense_rank"], "sparse_rank": h["sparse_rank"]},
+             "chunk": {"metadata": dict(h["metadata"]), "header": h["header"],
+                       "content": h["content"], "text": h["text"]}}
+            for h in hits]
+
+
+def answer(question: str) -> str:
+    """Answer one question and return the full reply as a string (nothing is streamed or printed).
+
+    Runs the same pipeline as the CLI: the same retrieval and reranking, prompt and model settings.
+    """
+    records, matrix = _get_index()
+    question = _clean_question(question)
+    hits = retrieve_chunks(question, records, matrix)
+    return "".join(generate_stream(build_messages(question, hits))).strip()
+
+
 # ---- CLI --------------------------------------------------------------------
 def main():
     records, matrix = load_index(force_rebuild="--reindex" in sys.argv)
@@ -590,7 +642,7 @@ def main():
             break
 
         # Retrieval is fast, so show what was found right away...
-        hits = retrieve(query, records, matrix)
+        hits = retrieve_chunks(query, records, matrix)
         print(f"\n{TOP_K_FUSED} Most relevant passages:")
         print("(Note: RRF scores are multiplied by 100 for readability.)")
         for h in hits:
