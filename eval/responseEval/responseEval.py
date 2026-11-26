@@ -3,11 +3,21 @@ import pandas as pd
 import json
 import ollama
 from tqdm import tqdm
+from pathlib import Path
+import sys
 
+PARENT_DIR = Path(__file__).parent
+
+#add root to path to allow for easy import of answer wrapper
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+from leo import wrapper
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
+
+#The script will automatically look for these file names as a sibling of the script. No need for long paths.
 
 INPUT_CSV = "LeoResponseEvalAnswerable.csv"
 OUTPUT_CSV = "leo_response_evaluation_results.csv"
@@ -172,7 +182,7 @@ Return valid JSON with this exact structure:
 def evaluate_dataset():
 
     # Read original CSV
-    df = pd.read_csv(INPUT_CSV)
+    df = pd.read_csv(PARENT_DIR / INPUT_CSV)
 
     required_columns = [
         "id",
@@ -196,7 +206,7 @@ def evaluate_dataset():
         ):
 
         question = str(row["question"])
-        ground_truth = str(row["ground truth"])
+        ground_truth = str(row["ground_truth"])
 
         try:
 
@@ -289,7 +299,7 @@ def evaluate_dataset():
 
     # Export results
     results_df.to_csv(
-        OUTPUT_CSV,
+        PARENT_DIR / OUTPUT_CSV,
         index=False
     )
 
@@ -315,7 +325,7 @@ def evaluate_dataset():
         results_df["evaluation_error"].notna().sum()
     )
 
-    print("\nResults saved to:", OUTPUT_CSV)
+    print("\nResults saved to:", PARENT_DIR / OUTPUT_CSV)
 
     return results_df
 
