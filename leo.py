@@ -23,7 +23,7 @@ import numpy as np
 import ollama
 import yaml
 
-from external_ingestion.announcementExtraction import get_announcements
+from external_auto_ingestion.announcements.announcementCache import get_cached_announcements_content
 
 # ---- Config ----------------------------------------------------------------
 DOCS_DIR = Path("data")
@@ -561,7 +561,7 @@ def build_messages(query: str, hits: list[dict]) -> list[dict]:
     </current_date>
     
     <most_recent_announcements>
-    {get_announcements()}
+    {get_cached_announcements_content()}
     </most_recent_announcements>
 
     <retrieved_context>

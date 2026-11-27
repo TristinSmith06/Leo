@@ -35,7 +35,7 @@ URL = "https://fhu-announcements.netlify.app/"
 TEXT_FLAG = f"The following information is from TJ Kirk's official announcements, extracted from the link {URL}"
 
 # Returned by get_page_text() when a page can't be fetched.
-FAILURE_FLAG = f"Failed to fetch announcements, they can be found manually at {URL}"
+FAILURE_FLAG = f"Failed to fetch announcements, they can be found manually by visiting {URL}"
 
 # Links with this class are written as "Text (absolute link)".
 LINK_CLASS = "btn-link"
@@ -103,7 +103,7 @@ def extract_text(html, base_url=""):
 
 
 # Extract announcement data from URL
-def get_announcements():
+def get_latest_announcement_content():
     """
     Fetch URL and return its extracted text as a string.
 

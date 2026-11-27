@@ -187,7 +187,7 @@ def evaluate_dataset():
     required_columns = [
         "id",
         "question",
-        "ground truth"
+        "ground_truth"
     ]
 
     for column in required_columns:
@@ -211,9 +211,11 @@ def evaluate_dataset():
         try:
 
             # Generate answer using existing RAG pipeline
+            print("Answering question with Leo")
             generated_answer = answer(question)
 
             # Run Ollama judge
+            print("Evaluating answer")
             evaluation = judge_answer(
                 question=question,
                 ground_truth=ground_truth,
